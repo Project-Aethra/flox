@@ -36,7 +36,7 @@ use url::Url;
 
 use crate::commands::general::update_config;
 use crate::config::Config;
-use crate::utils::dialog::{Checkpoint, Dialog};
+use crate::utils::dialog::{Dialog, WaitResult, wait_for_enter};
 use crate::utils::message;
 use crate::utils::openers::Browser;
 use crate::{Exit, subcommand_metric};
@@ -122,8 +122,6 @@ pub async fn authorize(client: ConfiguredClient, floxhub_url: &Url) -> Result<Cr
 
     let opener = Browser::detect();
 
-    let done = Arc::new(AtomicBool::default());
-
     let verification_uri = details
         .verification_uri_complete()
         .expect("Verification URI is always provided by the auth server")
@@ -131,35 +129,81 @@ pub async fn authorize(client: ConfiguredClient, floxhub_url: &Url) -> Result<Cr
         .as_str();
     let code = details.user_code().secret();
 
-    match opener {
+    let token_result = match opener {
         Ok(opener) => {
-            let message = formatdoc! {"
+            message::plain(formatdoc! {"
             Your one-time activation code is: {code}
 
-            Press enter to open {url} in your browser...
+            Open this URL in any browser:
+            {verification_uri}
+
+            Or press Enter to open {url} in your browser...
             ",
                 url = floxhub_url.host_str().unwrap_or(floxhub_url.as_str()),
-            };
+            });
 
             debug!(
                 "Waiting for user to enter code (timeout: {}s)",
                 details.expires_in().as_secs()
             );
 
-            Dialog {
-                message: &message,
-                help_message: None,
-                typed: Checkpoint,
-            }
-            .checkpoint()?;
+            // Start token polling and Enter-key listening concurrently.
+            // Whichever finishes first wins:
+            //   - Enter pressed → open the browser, then await the token
+            //   - Token received → cancel the Enter-wait (user used the URL)
+            //   - Ctrl-C → bail with cancellation message
+            //
+            // tokio::pin! keeps the token future alive across select! branches
+            // so we can await it after Enter wins the race.
+            let cancel = Arc::new(AtomicBool::new(false));
 
-            let mut command = opener.to_command();
-            command.arg(verification_uri);
+            let token_future = client.exchange_device_access_token(&details).request_async(
+                &http_client,
+                tokio::time::sleep,
+                Some(details.expires_in()),
+            );
+            tokio::pin!(token_future);
 
-            if command.spawn().is_err() {
-                message::warning(format!(
-                    "Could not open browser. Please open the following URL manually: {verification_uri}"
-                ));
+            let enter_future = wait_for_enter(cancel.clone());
+            tokio::pin!(enter_future);
+
+            // Run both futures concurrently; only the first branch to
+            // complete executes. The other future is dropped (token_future
+            // stays pinned so we can poll it again after Enter).
+            tokio::select! {
+                enter_result = &mut enter_future => {
+                    match enter_result {
+                        WaitResult::Enter => {
+                            // User pressed Enter — open the browser and then
+                            // wait for them to complete authentication.
+                            let mut command = opener.to_command();
+                            command.arg(verification_uri);
+
+                            if command.spawn().is_err() {
+                                message::warning(format!(
+                                    "Could not open browser. \
+                                     Please open the following URL manually: \
+                                     {verification_uri}"
+                                ));
+                            }
+
+                            token_future.await
+                        },
+                        WaitResult::Interrupted => {
+                            bail!("Authentication cancelled.");
+                        },
+                    }
+                },
+                token_result = &mut token_future => {
+                    // Token arrived before the user pressed Enter — they
+                    // completed auth via the copy/pasted URL. Signal the
+                    // Enter-wait task to exit (≤100ms) and surface the result.
+                    cancel.store(true, Ordering::Relaxed);
+                    // Drive enter_future to completion so its blocking thread
+                    // can observe the cancel flag and clean up raw mode.
+                    enter_future.await;
+                    token_result
+                },
             }
         },
         Err(e) => {
@@ -171,26 +215,29 @@ pub async fn authorize(client: ConfiguredClient, floxhub_url: &Url) -> Result<Cr
             Your one-time activation code is: {code}
             "
             });
-        },
-    }
 
-    let token_result = client
-        .exchange_device_access_token(&details)
-        .request_async(&http_client, tokio::time::sleep, Some(details.expires_in()))
-        .await;
+            client
+                .exchange_device_access_token(&details)
+                .request_async(
+                    &http_client,
+                    tokio::time::sleep,
+                    Some(details.expires_in()),
+                )
+                .await
+        },
+    };
 
     let token = match token_result {
-        Err(RequestTokenError::ServerResponse(r))
+        Err(RequestTokenError::ServerResponse(ref r))
             if r.error() == &DeviceCodeErrorResponseType::ExpiredToken =>
         {
             bail!(
-                "failed to authenticate before the device code expired. Please retry to get a new code."
+                "failed to authenticate before the device code expired. \
+                 Please retry to get a new code."
             );
         },
         _ => token_result?,
     };
-
-    done.store(true, Ordering::Relaxed);
 
     Ok(Credential {
         token: token.access_token().secret().to_string(),

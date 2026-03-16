@@ -1,9 +1,96 @@
 use std::fmt::Display;
 use std::io::IsTerminal;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::terminal;
 use inquire::ui::{Attributes, RenderConfig, StyleSheet, Styled};
 
 use super::{TERMINAL_STDERR, colors};
+
+/// Outcome of waiting for the user to press Enter.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WaitResult {
+    /// The user pressed Enter.
+    Enter,
+    /// The user pressed Ctrl-C.
+    Interrupted,
+}
+
+/// RAII guard that disables terminal raw mode on drop.
+///
+/// Ensures `disable_raw_mode()` is called even if the caller panics,
+/// preventing the terminal from being left in a corrupted state.
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enable() -> std::io::Result<Self> {
+        terminal::enable_raw_mode()?;
+        Ok(RawModeGuard)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        // Best-effort: ignore errors on cleanup
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+/// Wait for the user to press Enter, with cancellation support.
+///
+/// Spawns a blocking task that polls for keyboard events with a 100ms
+/// timeout so the cancel flag is checked frequently. When `cancel` is
+/// set to `true`, the function returns without waiting for Enter.
+///
+/// Returns [`WaitResult::Enter`] when Enter is pressed,
+/// or [`WaitResult::Interrupted`] when Ctrl-C is pressed or `cancel`
+/// is set by an external caller.
+pub async fn wait_for_enter(cancel: Arc<AtomicBool>) -> WaitResult {
+    tokio::task::spawn_blocking(move || {
+        // Enable raw mode so we receive individual keystrokes.
+        // The guard ensures raw mode is disabled on any exit path.
+        let _guard = match RawModeGuard::enable() {
+            Ok(g) => g,
+            Err(_) => return WaitResult::Interrupted,
+        };
+
+        loop {
+            // Check cancel flag before blocking on the next event.
+            if cancel.load(Ordering::Relaxed) {
+                return WaitResult::Interrupted;
+            }
+
+            // Poll with a short timeout so we re-check the cancel flag
+            // and don't block indefinitely.
+            match crossterm::event::poll(Duration::from_millis(100)) {
+                Ok(true) => {},
+                Ok(false) => continue,
+                Err(_) => return WaitResult::Interrupted,
+            }
+
+            match crossterm::event::read() {
+                Ok(Event::Key(KeyEvent {
+                    code: KeyCode::Enter,
+                    ..
+                })) => return WaitResult::Enter,
+                Ok(Event::Key(KeyEvent {
+                    code: KeyCode::Char('c'),
+                    modifiers,
+                    ..
+                })) if modifiers.contains(KeyModifiers::CONTROL) => {
+                    return WaitResult::Interrupted;
+                },
+                _ => {},
+            }
+        }
+    })
+    .await
+    // If the task panics, treat it as an interruption.
+    .unwrap_or(WaitResult::Interrupted)
+}
 
 #[allow(unused)]
 #[derive(Debug, Clone)]
@@ -14,9 +101,6 @@ pub struct Confirm {
 pub struct Select<T> {
     pub options: Vec<T>,
 }
-
-#[derive(Debug, Clone)]
-pub struct Checkpoint;
 
 #[derive(Debug, Clone)]
 pub struct Dialog<'a, Type> {
@@ -49,32 +133,6 @@ impl Dialog<'_, Confirm> {
         })
         .await
         .expect("Failed to join blocking dialog")
-    }
-}
-
-impl Dialog<'_, Checkpoint> {
-    /// Print the message and wait for the user to press enter
-    pub fn checkpoint(self) -> inquire::error::InquireResult<()> {
-        let message = self.message;
-        let help_message = self.help_message;
-
-        let _stderr_lock = TERMINAL_STDERR.lock();
-
-        let dialog = inquire::CustomType {
-            message,
-            default: None,
-            placeholder: None,
-            help_message,
-            starting_input: None,
-            formatter: &|()| "".to_string(),
-            default_value_formatter: &|()| "".to_string(),
-            parser: &|_| Ok(()),
-            validators: vec![],
-            error_message: "".to_string(),
-            render_config: flox_theme(),
-        };
-
-        dialog.prompt()
     }
 }
 
