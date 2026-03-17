@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::str::FromStr;
@@ -42,7 +42,12 @@ use super::build::{
 use super::git::{GitCommandError, GitCommandProvider, StatusInfo};
 use crate::data::CanonicalPath;
 use crate::flox::Flox;
-use crate::models::environment::{Environment, EnvironmentError, open_path};
+use crate::models::environment::{
+    ENVIRONMENT_POINTER_FILENAME,
+    Environment,
+    EnvironmentError,
+    open_path,
+};
 use crate::providers::auth::catalog_auth_to_envs;
 use crate::providers::git::GitProvider;
 use crate::providers::nix::nix_base_command;
@@ -883,6 +888,68 @@ pub fn build_repo_err(msg: &str) -> PublishError {
     PublishError::UnsupportedEnvironmentState(build_repo_err_msg(msg))
 }
 
+/// Verify that the critical environment files are tracked by git.
+/// Publishing creates a clean checkout, so untracked files won't be available.
+fn check_env_files_tracked(
+    flox: &Flox,
+    git: &GitCommandProvider,
+    environment: &impl Environment,
+) -> Result<(), PublishError> {
+    let dot_flox = environment.dot_flox_path();
+    let manifest_path = environment
+        .manifest_path(flox)
+        .map_err(|e| PublishError::UnsupportedEnvironmentState(e.to_string()))?;
+    let lockfile_path = environment
+        .lockfile_path(flox)
+        .map_err(|e| PublishError::UnsupportedEnvironmentState(e.to_string()))?;
+    let files_to_check = [
+        dot_flox.join(ENVIRONMENT_POINTER_FILENAME),
+        manifest_path,
+        lockfile_path,
+    ];
+
+    // ls-files prints tracked files, omits untracked ones
+    let mut cmd = git.new_command();
+    cmd.args(["ls-files", "-z"]);
+    for file in &files_to_check {
+        cmd.arg(file);
+    }
+    let output = cmd.output().map_err(|e| {
+        PublishError::UnsupportedEnvironmentState(format!("Failed to check git tracking: {e}"))
+    })?;
+    if !output.status.success() {
+        return Err(PublishError::UnsupportedEnvironmentState(format!(
+            "git ls-files failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let tracked_files: HashSet<&str> = stdout.split('\0').filter(|s| !s.is_empty()).collect();
+
+    let repo_root = git
+        .path()
+        .canonicalize()
+        .unwrap_or_else(|_| git.path().to_path_buf());
+    let untracked_files: Vec<_> = files_to_check
+        .iter()
+        .map(|file| file.strip_prefix(&repo_root).unwrap_or(file.as_path()))
+        .filter(|relative| !tracked_files.contains(relative.to_string_lossy().as_ref()))
+        .collect();
+
+    if !untracked_files.is_empty() {
+        let listing = untracked_files
+            .iter()
+            .map(|f| format!("- {}", f.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(build_repo_err(&formatdoc! {"
+            The following environment files are not tracked by git:
+            {listing}",
+        }));
+    }
+    Ok(())
+}
+
 /// Check the local repo that the build source is in to make sure that it's in
 /// a state amenable to publishing an artifact built from it.
 ///
@@ -991,8 +1058,9 @@ pub fn check_environment_metadata(
         PublishError::UnsupportedEnvironmentState(format!("Flox project path not in git repo: {e}"))
     })?;
 
-    let build_repo_meta = gather_build_repo_meta(&git)?;
+    check_env_files_tracked(flox, &git, environment)?;
 
+    let build_repo_meta = gather_build_repo_meta(&git)?;
     let toplevel_catalog_ref = find_toplevel_group_nixpkgs(&lockfile);
 
     Ok(CheckedEnvironmentMetadata {
@@ -1235,6 +1303,39 @@ pub mod tests {
                 .is_ok()
         );
         assert_eq!(build_repo_meta.rev_count, 1);
+    }
+
+    #[test]
+    fn test_check_env_files_tracked_success() {
+        let (flox, _temp_dir_handle) = flox_instance();
+        let (_tempdir_handle, _remote_repo, remote_uri) = example_git_remote_repo();
+        let (env, git) = example_path_environment(&flox, Some(&remote_uri));
+
+        check_env_files_tracked(&flox, &git, &env).expect("all env files should be tracked");
+    }
+
+    #[test]
+    fn test_check_env_files_tracked_untracked_file() {
+        let (flox, _temp_dir_handle) = flox_instance();
+        let (_tempdir_handle, _remote_repo, remote_uri) = example_git_remote_repo();
+        let (env, git) = example_path_environment(&flox, Some(&remote_uri));
+
+        let env_json_path = env.dot_flox_path().join(ENVIRONMENT_POINTER_FILENAME);
+        git.rm(&[env_json_path.as_path()], false, false, true)
+            .expect("cached remove of env.json");
+
+        let result = check_env_files_tracked(&flox, &git, &env);
+        match result {
+            Err(PublishError::UnsupportedEnvironmentState(msg)) => {
+                assert_eq!(
+                    msg,
+                    build_repo_err_msg(indoc! {"
+                    The following environment files are not tracked by git:
+                    - subdir_for_flox_stuff/.flox/env.json"})
+                );
+            },
+            _ => panic!("Expected UnsupportedEnvironmentState error"),
+        }
     }
 
     #[test]
