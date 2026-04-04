@@ -204,7 +204,7 @@ jobs:
 
   nix-build:
     name: "Nix build"
-    runs-on: "ubuntu-latest"
+    runs-on: "magnon-enterprise-runners"
     timeout-minutes: 120
 
     permissions:
@@ -291,7 +291,7 @@ jobs:
 
   nix-build-kerberos:
     name: "Verify Kerberos CLI build"
-    runs-on: "ubuntu-latest"
+    runs-on: "magnon-enterprise-runners"
     timeout-minutes: 60
 
     permissions:
@@ -360,7 +360,7 @@ jobs:
   trigger-flox-installers-workflow:
     name: "Build installers"
     if: ${{ (github.base_ref == 'refs/heads/main' || github.ref == 'refs/heads/main') && github.event_name == 'push' }}
-    runs-on: "ubuntu-latest"
+    runs-on: "magnon-enterprise-runners"
     timeout-minutes: 120
 
     needs:
@@ -413,7 +413,7 @@ jobs:
 
   report-failure:
     name: "Report Failure"
-    runs-on: "ubuntu-latest"
+    runs-on: "magnon-enterprise-runners"
     timeout-minutes: 30
 
     if: ${{ failure() && (github.base_ref == 'refs/heads/main' || github.ref == 'refs/heads/main') && github.event_name == 'push' }}
@@ -447,7 +447,7 @@ jobs:
 
   nix-build-bats-tests:
     name: "remote"
-    runs-on: "ubuntu-latest"
+    runs-on: "magnon-enterprise-runners"
     timeout-minutes: 90
 
     permissions:
